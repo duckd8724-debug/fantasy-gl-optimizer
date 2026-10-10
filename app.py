@@ -1,6 +1,7 @@
 import random
 import re
 from io import StringIO
+
 import pandas as pd
 import streamlit as st
 from PIL import Image
@@ -141,53 +142,119 @@ def generate(players, count, budget, squad_cap, limits, size, overlap, exposure_
         chosen.append({"players":best["players"],"captain":captain["player"],"vice":vice["player"],
                        "base":best["base"],"ceiling":best["ceiling"],
                        "projected_total":best["base"]+captain["expected_points"]+.5*vice["expected_points"]})
-        for name in names: exposure[name] += 1
+        for p in best["players"]: exposure[p["player"]] += 1
         candidates.remove(best)
     warning = None if len(chosen)==count else f"Only {len(chosen)} unique teams found. Increase candidate search or relax overlap/exposure settings."
     return chosen, warning
 
 
 def screenshot_ocr_to_text(uploaded_file):
-    """Read screenshot text with Tesseract. Always review OCR output."""
-    image = Image.open(uploaded_file).convert("RGB")
+    """Preprocess a mobile screenshot and OCR its two player-list columns separately."""
     if not OCR_AVAILABLE:
         return None, "OCR isn't installed. Check requirements.txt and packages.txt, then reboot the Streamlit app."
-    # Upscale small mobile screenshots to help recognition.
-    if image.width < 1200:
-        scale = 1200 / image.width
-        image = image.resize((1200, int(image.height * scale)))
-    text = pytesseract.image_to_string(image, config="--psm 6")
-    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
-    return "\n".join(lines), None
+
+    from PIL import ImageOps, ImageEnhance, ImageFilter
+
+    image = Image.open(uploaded_file).convert("RGB")
+    width, height = image.size
+
+    # Most fantasy app screenshots are tall. Remove a little browser chrome,
+    # though cropping in Gallery to the player list usually gives better results.
+    if height > width * 1.15:
+        image = image.crop((0, int(height * 0.12), width, int(height * 0.96)))
+
+    width, height = image.size
+    midpoint = width // 2
+    columns = [
+        ("LEFT", image.crop((0, 0, midpoint, height))),
+        ("RIGHT", image.crop((midpoint, 0, width, height))),
+    ]
+
+    output = []
+    for label, column in columns:
+        scale = max(1.5, min(4.0, 1100 / max(1, column.width)))
+        column = column.resize((int(column.width * scale), int(column.height * scale)))
+        column = ImageOps.grayscale(column)
+        column = ImageEnhance.Contrast(column).enhance(1.8)
+        column = ImageEnhance.Sharpness(column).enhance(1.6)
+        column = column.filter(ImageFilter.SHARPEN)
+        text = pytesseract.image_to_string(column, config="--psm 6")
+        lines = [
+            re.sub(r"\s+", " ", line).strip()
+            for line in text.splitlines()
+            if line.strip()
+        ]
+        output.append(f"--- {label} PLAYER COLUMN ---\n" + "\n".join(lines))
+
+    return "\n\n".join(output), None
 
 
 def parse_selection_rows(raw_text):
-    """Best-effort parser for lines such as 'Rajat Patidar ... Sel By 75%'."""
+    """Conservatively pair OCR player names with percentages; mark every row for review."""
     rows = []
-    for line in raw_text.splitlines():
-        clean_line = re.sub(r"\s+", " ", line).strip()
-        pct = re.search(r"(?:sel(?:ected)?\s*by\s*)?(\d{1,3})\s*%", clean_line, re.I)
-        if not pct:
-            continue
-        value = int(pct.group(1))
-        if value > 100:
-            continue
-        # Remove selection label, percentage and common OCR noise after the name.
-        name = clean_line[:pct.start()].strip(" .|:-–—")
-        name = re.sub(r"(?i)\bsel(?:ected)?\s*by\b", "", name).strip(" .|:-–—")
-        # OCR can put role icons / points in the line; trim trailing number fragments.
-        name = re.sub(r"\b(?:pts?|points?)\s*\d+.*$", "", name, flags=re.I).strip()
-        if len(name) < 2:
-            continue
-        rows.append({"player": name, "selection_pct": value})
-    # Avoid duplicate lines while preserving order.
-    unique = []
-    seen = set()
+    sections = re.split(r"--- (?:LEFT|RIGHT) PLAYER COLUMN ---", raw_text)
+
+    ignore = re.compile(
+        r"(?i)(sel\s*by|selected\s*by|points?|avg\.?\s*score|pitch|supports?|"
+        r"confirmed|elected|batting|pacers|ind-a|aus-a|team preview|share|"
+        r"streamlit|chrome|http|screenshot|playing\s*11)"
+    )
+    percent_pattern = re.compile(r"(?i)(?:sel\s*by\s*)?(\d{1,3})\s*%")
+
+    for section in sections:
+        lines = [
+            re.sub(r"\s+", " ", line).strip(" .|:;")
+            for line in section.splitlines()
+            if line.strip()
+        ]
+        pending_name = None
+
+        for line in lines:
+            matches = list(percent_pattern.finditer(line))
+            if matches:
+                for match in matches:
+                    pct = int(match.group(1))
+                    if not 0 <= pct <= 100:
+                        continue
+
+                    before = line[:match.start()].strip(" .|:;,-")
+                    before = re.sub(r"(?i)\bsel\s*by\b", "", before).strip(" .|:;,-")
+                    before = re.sub(r"(?i)\b(?:points?|pts?)\b.*$", "", before).strip(" .|:;,-")
+                    letters = re.sub(r"[^A-Za-z]", "", before)
+                    name = before if len(letters) >= 4 and not ignore.search(before) else pending_name
+
+                    if name:
+                        rows.append({
+                            "player": name,
+                            "selection_pct": pct,
+                            "review_required": True,
+                        })
+                    pending_name = None
+                continue
+
+            if ignore.search(line) or re.search(r"\d", line):
+                continue
+
+            candidate = re.sub(r"[^A-Za-z .'-]", "", line).strip(" .'-")
+            letters = re.sub(r"[^A-Za-z]", "", candidate)
+            if 4 <= len(letters) <= 28 and len(candidate) <= 40:
+                pending_name = candidate
+
+    unique, seen = [], set()
     for row in rows:
-        key = re.sub(r"[^a-z0-9]", "", row["player"].lower())
-        if key and key not in seen:
-            unique.append(row); seen.add(key)
-    return pd.DataFrame(unique, columns=["player", "selection_pct"])
+        name = re.sub(r"\s+", " ", row["player"]).strip(" .'-")
+        key = re.sub(r"[^a-z]", "", name.lower())
+        signature = (key, int(row["selection_pct"]))
+        if len(key) >= 4 and signature not in seen:
+            unique.append({
+                "player": name,
+                "selection_pct": int(row["selection_pct"]),
+                "review_required": True,
+            })
+            seen.add(signature)
+
+    return pd.DataFrame(unique, columns=["player", "selection_pct", "review_required"])
+
 
 st.title("🏏 Fantasy GL Optimizer — V1")
 st.caption("Manual-input starter. This does not guarantee a winning team or provide live player predictions.")
@@ -303,35 +370,3 @@ with t3:
                     st.session_state["ocr_players"] = pd.DataFrame(columns=["player", "selection_pct", "source_screenshot"])
         if "ocr_raw_text" in st.session_state:
             st.subheader("1. Extracted player table — edit OCR mistakes")
-            extracted = st.session_state.get("ocr_players", pd.DataFrame())
-            if extracted.empty:
-                st.warning("No selection percentages were detected. Try a clearer screenshot with ‘Sel By (%)’ visible, or inspect the raw OCR text below.")
-            else:
-                edited_ocr = st.data_editor(extracted, num_rows="dynamic", use_container_width=True, key="ocr_editor")
-                st.session_state["ocr_players"] = edited_ocr
-                st.download_button("Download extracted names + selection % CSV", edited_ocr.to_csv(index=False).encode("utf-8-sig"), "ocr_extracted_players.csv", "text/csv", key="download_ocr_csv")
-                st.info("This CSV contains only the name and selection percentage read from the screenshot. It does not fill credits, role, expected points, or confirmed XI automatically.")
-            with st.expander("Show raw OCR text for troubleshooting"):
-                st.text_area("Raw text", st.session_state["ocr_raw_text"], height=260)
-    st.markdown("### Next: use the extracted data")
-    st.write("Download the extracted CSV, check spelling, and fill in team, role, credits, expected points, ceiling and playing XI in the Enter players tab before generating teams.")
-    st.caption("OCR is best-effort: small text, icons, split columns and truncated names can cause errors. Always compare with the screenshot.")
-
-with t4:
-    st.markdown("""
-### Run instructions
-1. Replace fictional sample players with actual players.
-2. Use roles `WK`, `BAT`, `AR`, `BOWL`.
-3. Enter credits, expected fantasy points, a plausible high-end ceiling, and selection percentage if known.
-4. Mark playing players `yes`, others `no`. Regenerate after the official XI is announced.
-5. Confirm rules and scoring inside the current My11Circle contest.
-6. Generate teams and download the CSV files.
-
-### Important limitations
-- No live data, historical model, or automated player prediction is included in V1.
-- Team generation is a randomized heuristic, not a proof of an optimal portfolio.
-- The expected-points and ceiling columns are user estimates.
-- A differential is not automatically a good pick just because its selection percentage is low.
-- Use practice and historical evaluation first. No team can be guaranteed to win.
-""")
-    st.download_button("Download fictional sample data",SAMPLE.encode(),"sample_players.csv","text/csv")
