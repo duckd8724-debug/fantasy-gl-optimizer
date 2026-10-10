@@ -1,7 +1,15 @@
 import random
+import re
 from io import StringIO
 import pandas as pd
 import streamlit as st
+from PIL import Image
+
+try:
+    import pytesseract
+    OCR_AVAILABLE = True
+except Exception:
+    OCR_AVAILABLE = False
 
 st.set_page_config(page_title="Fantasy GL Optimizer V1", page_icon="🏏", layout="wide")
 ROLES = ["WK", "BAT", "AR", "BOWL"]
@@ -138,6 +146,17 @@ def generate(players, count, budget, squad_cap, limits, size, overlap, exposure_
     warning = None if len(chosen)==count else f"Only {len(chosen)} unique teams found. Increase candidate search or relax overlap/exposure settings."
     return chosen, warning
 
+
+def screenshot_ocr_to_csv(uploaded_file):
+    """Optional OCR helper. OCR text needs user review; it is not guaranteed accurate."""
+    image = Image.open(uploaded_file).convert("RGB")
+    if not OCR_AVAILABLE:
+        return None, "OCR library is not installed in this deployment. Use the manual screenshot transcription table below."
+    text = pytesseract.image_to_string(image)
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
+    # Do not guess team/role/credits from OCR. Provide raw text for correction instead.
+    return "\n".join(lines), None
+
 st.title("🏏 Fantasy GL Optimizer — V1")
 st.caption("Manual-input starter. This does not guarantee a winning team or provide live player predictions.")
 with st.sidebar:
@@ -159,7 +178,7 @@ with st.sidebar:
     attempts=st.slider("Candidate search attempts",500,20000,5000,500)
     seed=st.number_input("Random seed",1,999999,42)
 
-t1,t2,t3=st.tabs(["1. Enter players","2. Generate teams","3. Instructions"])
+t1,t2,t3,t4=st.tabs(["1. Enter players","2. Generate teams","3. Screenshot input","4. Instructions"])
 with t1:
     st.write("Required fields: player, team, role, credits, expected_points, ceiling, selection_pct, playing_xi.")
     st.info("The sample players are fictional. Replace them with the real match player pool.")
@@ -220,6 +239,27 @@ with t2:
         st.subheader("Validation")
         st.dataframe(pd.DataFrame(checks),use_container_width=True,hide_index=True)
 with t3:
+    st.subheader("Screenshot-based input")
+    st.write("Upload a screenshot of the fantasy app. This first version helps you review the image and enter the extracted information; OCR may not be available on every free host.")
+    shots = st.file_uploader("Upload one or more screenshots", type=["png","jpg","jpeg"], accept_multiple_files=True, key="screenshot_upload")
+    if shots:
+        for ix, shot in enumerate(shots, 1):
+            st.markdown(f"**Screenshot {ix}: {shot.name}**")
+            st.image(shot, use_container_width=True)
+        st.info("For accuracy, enter the player names, real teams, roles and credits in the Enter players tab. Use the screenshot to copy details. Do not treat app points as predicted future fantasy points unless their meaning is confirmed.")
+        if st.button("Try to read text from first screenshot", key="try_ocr"):
+            raw_text, err = screenshot_ocr_to_csv(shots[0])
+            if err:
+                st.warning(err)
+            elif raw_text:
+                st.text_area("OCR text (review and correct every line)", raw_text, height=260)
+                st.caption("OCR can misread names, numbers and order. Verify against the original screenshot.")
+    st.markdown("### Quick player entry template")
+    st.write("You can use the editable player table in Enter players. Required role codes: WK, BAT, AR, BOWL. Mark confirmed players as yes.")
+    st.markdown("### Match conditions to note")
+    st.write("Pitch type, pace/spin support, average score, toss winner/decision, and confirmed Playing XI should be entered as notes. Version 1 does not yet use these notes in a predictive model.")
+
+with t4:
     st.markdown("""
 ### Run instructions
 1. Replace fictional sample players with actual players.
