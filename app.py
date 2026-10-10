@@ -147,15 +147,47 @@ def generate(players, count, budget, squad_cap, limits, size, overlap, exposure_
     return chosen, warning
 
 
-def screenshot_ocr_to_csv(uploaded_file):
-    """Optional OCR helper. OCR text needs user review; it is not guaranteed accurate."""
+def screenshot_ocr_to_text(uploaded_file):
+    """Read screenshot text with Tesseract. Always review OCR output."""
     image = Image.open(uploaded_file).convert("RGB")
     if not OCR_AVAILABLE:
-        return None, "OCR library is not installed in this deployment. Use the manual screenshot transcription table below."
-    text = pytesseract.image_to_string(image)
+        return None, "OCR isn't installed. Check requirements.txt and packages.txt, then reboot the Streamlit app."
+    # Upscale small mobile screenshots to help recognition.
+    if image.width < 1200:
+        scale = 1200 / image.width
+        image = image.resize((1200, int(image.height * scale)))
+    text = pytesseract.image_to_string(image, config="--psm 6")
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
-    # Do not guess team/role/credits from OCR. Provide raw text for correction instead.
     return "\n".join(lines), None
+
+
+def parse_selection_rows(raw_text):
+    """Best-effort parser for lines such as 'Rajat Patidar ... Sel By 75%'."""
+    rows = []
+    for line in raw_text.splitlines():
+        clean_line = re.sub(r"\s+", " ", line).strip()
+        pct = re.search(r"(?:sel(?:ected)?\s*by\s*)?(\d{1,3})\s*%", clean_line, re.I)
+        if not pct:
+            continue
+        value = int(pct.group(1))
+        if value > 100:
+            continue
+        # Remove selection label, percentage and common OCR noise after the name.
+        name = clean_line[:pct.start()].strip(" .|:-–—")
+        name = re.sub(r"(?i)\bsel(?:ected)?\s*by\b", "", name).strip(" .|:-–—")
+        # OCR can put role icons / points in the line; trim trailing number fragments.
+        name = re.sub(r"\b(?:pts?|points?)\s*\d+.*$", "", name, flags=re.I).strip()
+        if len(name) < 2:
+            continue
+        rows.append({"player": name, "selection_pct": value})
+    # Avoid duplicate lines while preserving order.
+    unique = []
+    seen = set()
+    for row in rows:
+        key = re.sub(r"[^a-z0-9]", "", row["player"].lower())
+        if key and key not in seen:
+            unique.append(row); seen.add(key)
+    return pd.DataFrame(unique, columns=["player", "selection_pct"])
 
 st.title("🏏 Fantasy GL Optimizer — V1")
 st.caption("Manual-input starter. This does not guarantee a winning team or provide live player predictions.")
@@ -239,25 +271,51 @@ with t2:
         st.subheader("Validation")
         st.dataframe(pd.DataFrame(checks),use_container_width=True,hide_index=True)
 with t3:
-    st.subheader("Screenshot-based input")
-    st.write("Upload a screenshot of the fantasy app. This first version helps you review the image and enter the extracted information; OCR may not be available on every free host.")
-    shots = st.file_uploader("Upload one or more screenshots", type=["png","jpg","jpeg"], accept_multiple_files=True, key="screenshot_upload")
+    st.subheader("Screenshot OCR — automatic player names + selection %")
+    st.write("Upload the screen where the fantasy app shows player names and ‘Sel By (%)’. OCR reads visible text; verify every extracted row before using it.")
+    shots = st.file_uploader("Upload one or more screenshots", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="screenshot_upload")
+    if not OCR_AVAILABLE:
+        st.warning("OCR is not active in this deployment yet. The updated project needs both pytesseract in requirements.txt and tesseract-ocr in packages.txt.")
     if shots:
         for ix, shot in enumerate(shots, 1):
             st.markdown(f"**Screenshot {ix}: {shot.name}**")
             st.image(shot, use_container_width=True)
-        st.info("For accuracy, enter the player names, real teams, roles and credits in the Enter players tab. Use the screenshot to copy details. Do not treat app points as predicted future fantasy points unless their meaning is confirmed.")
-        if st.button("Try to read text from first screenshot", key="try_ocr"):
-            raw_text, err = screenshot_ocr_to_csv(shots[0])
-            if err:
-                st.warning(err)
-            elif raw_text:
-                st.text_area("OCR text (review and correct every line)", raw_text, height=260)
-                st.caption("OCR can misread names, numbers and order. Verify against the original screenshot.")
-    st.markdown("### Quick player entry template")
-    st.write("You can use the editable player table in Enter players. Required role codes: WK, BAT, AR, BOWL. Mark confirmed players as yes.")
-    st.markdown("### Match conditions to note")
-    st.write("Pitch type, pace/spin support, average score, toss winner/decision, and confirmed Playing XI should be entered as notes. Version 1 does not yet use these notes in a predictive model.")
+        if st.button("Extract names and selection %", type="primary", key="try_ocr"):
+            all_rows = []
+            all_text = []
+            for shot in shots:
+                raw_text, err = screenshot_ocr_to_text(shot)
+                if err:
+                    st.error(err)
+                    break
+                all_text.append(f"--- {shot.name} ---\n{raw_text}")
+                parsed = parse_selection_rows(raw_text)
+                if not parsed.empty:
+                    parsed["source_screenshot"] = shot.name
+                    all_rows.append(parsed)
+            else:
+                st.session_state["ocr_raw_text"] = "\n\n".join(all_text)
+                if all_rows:
+                    extracted = pd.concat(all_rows, ignore_index=True)
+                    extracted = extracted.drop_duplicates(subset=["player", "selection_pct"], keep="first")
+                    st.session_state["ocr_players"] = extracted
+                else:
+                    st.session_state["ocr_players"] = pd.DataFrame(columns=["player", "selection_pct", "source_screenshot"])
+        if "ocr_raw_text" in st.session_state:
+            st.subheader("1. Extracted player table — edit OCR mistakes")
+            extracted = st.session_state.get("ocr_players", pd.DataFrame())
+            if extracted.empty:
+                st.warning("No selection percentages were detected. Try a clearer screenshot with ‘Sel By (%)’ visible, or inspect the raw OCR text below.")
+            else:
+                edited_ocr = st.data_editor(extracted, num_rows="dynamic", use_container_width=True, key="ocr_editor")
+                st.session_state["ocr_players"] = edited_ocr
+                st.download_button("Download extracted names + selection % CSV", edited_ocr.to_csv(index=False).encode("utf-8-sig"), "ocr_extracted_players.csv", "text/csv", key="download_ocr_csv")
+                st.info("This CSV contains only the name and selection percentage read from the screenshot. It does not fill credits, role, expected points, or confirmed XI automatically.")
+            with st.expander("Show raw OCR text for troubleshooting"):
+                st.text_area("Raw text", st.session_state["ocr_raw_text"], height=260)
+    st.markdown("### Next: use the extracted data")
+    st.write("Download the extracted CSV, check spelling, and fill in team, role, credits, expected points, ceiling and playing XI in the Enter players tab before generating teams.")
+    st.caption("OCR is best-effort: small text, icons, split columns and truncated names can cause errors. Always compare with the screenshot.")
 
 with t4:
     st.markdown("""
