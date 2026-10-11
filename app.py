@@ -370,3 +370,50 @@ with t3:
                     st.session_state["ocr_players"] = pd.DataFrame(columns=["player", "selection_pct", "source_screenshot"])
         if "ocr_raw_text" in st.session_state:
             st.subheader("1. Extracted player table — edit OCR mistakes")
+            extracted_df = st.session_state.get(
+            "ocr_players",
+            pd.DataFrame(columns=["player", "selection_pct", "source_screenshot"])
+        )
+
+        if extracted_df.empty:
+            st.warning(
+                "No player names were detected. Try a clearer screenshot "
+                "showing player names and selection percentages."
+            )
+        else:
+            st.success(f"Extracted {len(extracted_df)} rows. Please verify them.")
+            st.caption(
+                "Edit incorrect names or percentages before downloading. "
+                "OCR results may contain mistakes."
+            )
+
+            edited_ocr = st.data_editor(
+                extracted_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="ocr_player_editor"
+            )
+
+            st.session_state["ocr_players"] = edited_ocr
+
+            st.download_button(
+                "Download extracted players CSV",
+                edited_ocr.to_csv(index=False).encode("utf-8"),
+                "extracted_players.csv",
+                "text/csv",
+                key="download_ocr_players"
+            )
+
+        with st.expander("View raw OCR text"):
+            st.text(st.session_state["ocr_raw_text"])
+
+with t4:
+st.subheader("Instructions")
+st.markdown("""
+1. Upload a player CSV in the Enter players tab, or enter players manually.
+2. Check player roles, credits, estimates and confirmed playing XI.
+3. Use Generate teams to create candidate teams.
+4. In Screenshot input, upload screenshots showing player names and selection percentages.
+5. Review OCR results carefully and download the extracted CSV.
+6. OCR only extracts names and selection percentages; it does not automatically fill every field required for team generation.
+""")
